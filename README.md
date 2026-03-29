@@ -1,4 +1,6 @@
-# DuxMeaBan
+# DuxMeaBan -  by sulf
+
+<img width="1357" height="876" alt="Screenshot 2026-03-29 013318" src="https://github.com/user-attachments/assets/18c8a683-703f-4c2c-a427-74114dbd2391" />
 
 `Linux-only` terminal application with a `Bash TUI` and `Playwright` helpers for:
 

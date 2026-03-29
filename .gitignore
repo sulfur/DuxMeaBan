@@ -1,0 +1,9 @@
+.codex/
+node_modules/
+out/
+screenshot/
+screenshots/
+config/profiles.json
+config/*.local.json
+data/reports.json
+*.log

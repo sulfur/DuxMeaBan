@@ -1,0 +1,15 @@
+{
+  "name": "dux-mea-ban",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Linux-only terminal app for preparing and tracking Instagram legal-report workflows with a Bash TUI and Playwright helpers.",
+  "type": "module",
+  "scripts": {
+    "start": "bash ./report.sh",
+    "assist": "node ./scripts/assist.mjs",
+    "check-status": "node ./scripts/check-profile-status.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.54.2"
+  }
+}

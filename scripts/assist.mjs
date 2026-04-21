@@ -54,7 +54,8 @@ function assertString(value, name) {
 }
 
 function resolveCommandPath(command) {
-  const result = spawnSync('which', [command], { encoding: 'utf8' });
+  const resolver = process.platform === 'win32' ? 'where.exe' : 'which';
+  const result = spawnSync(resolver, [command], { encoding: 'utf8' });
 
   if (result.status !== 0) {
     return '';
@@ -66,12 +67,21 @@ function resolveCommandPath(command) {
     .find(Boolean) || '';
 }
 
-function detectBrowserPath() {
-  if (process.env.PLAYWRIGHT_BROWSER_PATH && fsSync.existsSync(process.env.PLAYWRIGHT_BROWSER_PATH)) {
-    return process.env.PLAYWRIGHT_BROWSER_PATH;
+function browserCandidates() {
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || '';
+
+    return [
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+      'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+      localAppData ? path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+      localAppData ? path.join(localAppData, 'Microsoft', 'Edge', 'Application', 'msedge.exe') : ''
+    ].filter(Boolean);
   }
 
-  const explicitCandidates = [
+  return [
     '/usr/bin/google-chrome-stable',
     '/usr/bin/google-chrome',
     '/usr/bin/chromium',
@@ -79,8 +89,14 @@ function detectBrowserPath() {
     '/usr/bin/microsoft-edge',
     '/usr/bin/microsoft-edge-stable'
   ];
+}
 
-  for (const candidate of explicitCandidates) {
+function detectBrowserPath() {
+  if (process.env.PLAYWRIGHT_BROWSER_PATH && fsSync.existsSync(process.env.PLAYWRIGHT_BROWSER_PATH)) {
+    return process.env.PLAYWRIGHT_BROWSER_PATH;
+  }
+
+  for (const candidate of browserCandidates()) {
     if (fsSync.existsSync(candidate)) {
       return candidate;
     }
@@ -103,7 +119,11 @@ function detectBrowserPath() {
     }
   }
 
-  throw new Error('No supported browser executable found. Set PLAYWRIGHT_BROWSER_PATH or install Chromium/Chrome/Edge for Linux.');
+  throw new Error(
+    process.platform === 'win32'
+      ? 'No supported browser executable found. Set PLAYWRIGHT_BROWSER_PATH or install Chrome or Edge for Windows.'
+      : 'No supported browser executable found. Set PLAYWRIGHT_BROWSER_PATH or install Chromium, Chrome, or Edge for Linux.'
+  );
 }
 
 async function readPayload(payloadPath) {

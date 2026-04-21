@@ -48,6 +48,8 @@ NODE_REPORTS_PATH=""
 NODE_OUT_DIR=""
 NODE_ASSIST_SCRIPT=""
 NODE_CHECK_PROFILE_SCRIPT=""
+NODE_REPORT_STATUS_LINES_SCRIPT=""
+NODE_REPORT_STATUS_RESULTS_SCRIPT=""
 NODE_PAYLOAD_PATH=""
 NODE_TEXT_PATH=""
 NODE_SCREENSHOT_PATH=""
@@ -154,6 +156,22 @@ to_node_path() {
     return
   fi
 
+  if [[ "$path" =~ ^/([[:alpha:]])/(.*)$ ]]; then
+    drive_letter="${BASH_REMATCH[1]}"
+    windows_rest="${BASH_REMATCH[2]}"
+    drive_letter="${drive_letter^^}"
+    printf '%s:/%s\n' "$drive_letter" "$windows_rest"
+    return
+  fi
+
+  if command -v cygpath >/dev/null 2>&1; then
+    fallback="$(cygpath -m "$path" 2>/dev/null || true)"
+    if [[ -n "$fallback" ]]; then
+      printf '%s\n' "$fallback"
+      return
+    fi
+  fi
+
   if command -v wslpath >/dev/null 2>&1; then
     fallback="$(wslpath -m "$path" 2>/dev/null || true)"
     if [[ -n "$fallback" ]]; then
@@ -172,6 +190,8 @@ refresh_node_paths() {
   NODE_OUT_DIR="$(to_node_path "$OUT_DIR")"
   NODE_ASSIST_SCRIPT="$(to_node_path "$ASSIST_SCRIPT")"
   NODE_CHECK_PROFILE_SCRIPT="$(to_node_path "$CHECK_PROFILE_SCRIPT")"
+  NODE_REPORT_STATUS_LINES_SCRIPT="$(to_node_path "$ROOT_DIR/scripts/report-status-lines.mjs")"
+  NODE_REPORT_STATUS_RESULTS_SCRIPT="$(to_node_path "$ROOT_DIR/scripts/report-status-results.mjs")"
   NODE_PAYLOAD_PATH="$(to_node_path "$PAYLOAD_PATH")"
   NODE_TEXT_PATH="$(to_node_path "$TEXT_PATH")"
   NODE_SCREENSHOT_PATH="$(to_node_path "$SCREENSHOT_PATH")"
@@ -965,8 +985,10 @@ reports.push({
   courtOrder: 'no',
   consent: 'yes',
   status: 'Submitted',
-  accountStatus: 'Pending',
+  accountStatus: 'Active',
   accountStatusCheckedAtLocal: '',
+  postStatuses: [],
+  postStatusesCheckedAtLocal: '',
   reportedUsername: deriveUsername(profileUrl),
   textPath,
   jsonPath,
@@ -990,7 +1012,7 @@ reports
   .slice()
   .sort((a, b) => String(b.createdAtLocal || '').localeCompare(String(a.createdAtLocal || '')))
   .forEach((report) => {
-    const visibleStatus = String(report.accountStatus || '').trim() || 'Pending';
+    const visibleStatus = String(report.accountStatus || '').trim() || 'Active';
     console.log([
       String(report.createdAtLocal || ''),
       String(report.configurationName || ''),
@@ -2773,19 +2795,21 @@ NODE
 
 tui_parse_report_line() {
   local line="$1"
-  IFS='|' read -r REPORT_ID REPORT_TARGET REPORT_STATUS REPORT_CREATED_AT REPORT_CONFIGURATION REPORT_PROFILE_URL <<<"$line"
+  IFS='|' read -r REPORT_ID REPORT_TARGET REPORT_STATUS REPORT_CREATED_AT REPORT_CONFIGURATION REPORT_PROFILE_URL REPORT_POST_URLS_JSON REPORT_POST_STATUSES_JSON REPORT_STATUS_CHECKED_AT <<<"$line"
 }
 
-tui_set_report_line_status_local() {
+tui_set_report_check_results_local() {
   local report_index="$1"
-  local next_status="$2"
+  local next_profile_status="$2"
+  local next_status_checked_at="$3"
+  local next_post_statuses_json="$4"
 
   if (( report_index < 0 || report_index >= ${#REPORT_LINES[@]} )); then
     return
   fi
 
   tui_parse_report_line "${REPORT_LINES[$report_index]}"
-  REPORT_LINES[$report_index]="${REPORT_ID}|${REPORT_TARGET}|${next_status}|${REPORT_CREATED_AT}|${REPORT_CONFIGURATION}|${REPORT_PROFILE_URL}"
+  REPORT_LINES[$report_index]="${REPORT_ID}|${REPORT_TARGET}|${next_profile_status}|${REPORT_CREATED_AT}|${REPORT_CONFIGURATION}|${REPORT_PROFILE_URL}|${REPORT_POST_URLS_JSON}|${next_post_statuses_json}|${next_status_checked_at}"
 }
 
 tui_load_report_lines() {
@@ -2801,6 +2825,8 @@ reports
   .sort((a, b) => String(b.createdAtLocal || '').localeCompare(String(a.createdAtLocal || '')))
   .forEach((report) => {
     const profileUrl = String(report.profileUrl || '').trim();
+    const postUrls = Array.isArray(report.postUrls) ? report.postUrls : [];
+    const postStatuses = Array.isArray(report.postStatuses) ? report.postStatuses : [];
     let target = String(report.reportedUsername || '').trim();
 
     if (!target && profileUrl) {
@@ -2820,7 +2846,7 @@ reports
     let accountStatus = String(report.accountStatus || '').trim();
 
     if (!accountStatus) {
-      accountStatus = 'Pending';
+      accountStatus = 'Active';
     }
 
     console.log([
@@ -2829,68 +2855,114 @@ reports
       accountStatus,
       String(report.createdAtLocal || ''),
       String(report.configurationName || ''),
-      profileUrl
+      profileUrl,
+      JSON.stringify(postUrls),
+      JSON.stringify(postStatuses),
+      String(report.accountStatusCheckedAtLocal || '')
     ].join('|'));
   });
 NODE
 )
 }
 
-tui_set_report_account_status() {
+tui_update_report_check_results() {
   local target_id="$1"
-  local account_status="$2"
+  local result_json="$2"
+  local status_line=""
 
-  "$NODE_BIN" - "$NODE_REPORTS_PATH" "$target_id" "$account_status" <<'NODE'
-const fs = require('fs');
-
-const [reportsPath, targetId, accountStatusArg] = process.argv.slice(2);
-const raw = fs.existsSync(reportsPath) ? fs.readFileSync(reportsPath, 'utf8').trim() : '[]';
-const reports = raw ? JSON.parse(raw) : [];
-const normalizedStatus = String(accountStatusArg || '').trim().toLowerCase() === 'banned' ? 'Banned' : 'Pending';
-const pad = (value) => String(value).padStart(2, '0');
-const now = new Date();
-const checkedAtLocal = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
-
-for (const report of reports) {
-  if (String(report.id || '') !== String(targetId || '')) {
-    continue;
-  }
-
-  report.accountStatus = normalizedStatus;
-  report.accountStatusCheckedAtLocal = checkedAtLocal;
-
-  if (!report.reportedUsername) {
-    const rawUrl = String(report.profileUrl || '').trim();
-
-    if (rawUrl) {
-      try {
-        const parsed = new URL(rawUrl);
-        const parts = parsed.pathname.split('/').filter(Boolean);
-        report.reportedUsername = parts[0] ? `@${parts[0]}` : rawUrl;
-      } catch {
-        report.reportedUsername = rawUrl;
-      }
-    }
-  }
+  status_line="$("$NODE_BIN" "$NODE_REPORT_STATUS_RESULTS_SCRIPT" --reports-path "$NODE_REPORTS_PATH" --target-id "$target_id" --result-json "$result_json")"
+  printf '%s\n' "$status_line"
 }
 
-fs.writeFileSync(reportsPath, JSON.stringify(reports, null, 2));
+build_unreachable_post_statuses_json() {
+  local post_urls_json="${1:-[]}"
+  local checked_at_local="${2:-}"
+
+  "$NODE_BIN" - "$post_urls_json" "$checked_at_local" <<'NODE'
+const [postUrlsJsonArg, checkedAtLocalArg] = process.argv.slice(2);
+let postUrls = [];
+
+try {
+  const parsed = JSON.parse(String(postUrlsJsonArg || '[]'));
+  if (Array.isArray(parsed)) {
+    postUrls = parsed;
+  }
+} catch {
+  postUrls = [];
+}
+
+const pad = (value) => String(value).padStart(2, '0');
+const now = new Date();
+const checkedAtLocal = String(checkedAtLocalArg || '').trim() || `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+const postStatuses = postUrls.map((value, index) => ({
+  label: `Post ${index + 1}`,
+  url: String(value || '').trim(),
+  status: 'Unreachable',
+  checkedAtLocal
+}));
+
+process.stdout.write(`${JSON.stringify(postStatuses)}\n`);
 NODE
 }
 
-run_profile_status_check() {
+run_report_status_check() {
   local profile_url="$1"
+  local post_urls_json="${2:-[]}"
+  local targets_json=""
   local output=""
   local exit_code=0
-  local status="Pending"
 
   if [[ -z "$profile_url" ]]; then
-    printf 'Pending\n'
+    printf '%s\n' '{"results":[]}'
     return 0
   fi
 
+  targets_json="$("$NODE_BIN" - "$profile_url" "$post_urls_json" <<'NODE'
+const [profileUrlArg, postUrlsJsonArg] = process.argv.slice(2);
+const profileUrl = String(profileUrlArg || '').trim();
+let postUrls = [];
+
+try {
+  const parsed = JSON.parse(String(postUrlsJsonArg || '[]'));
+  if (Array.isArray(parsed)) {
+    postUrls = parsed;
+  }
+} catch {
+  postUrls = [];
+}
+
+const targets = [];
+
+if (profileUrl) {
+  targets.push({
+    id: 'profile',
+    kind: 'profile',
+    label: 'Profile',
+    url: profileUrl
+  });
+}
+
+postUrls.forEach((value, index) => {
+  const url = String(value || '').trim();
+
+  if (!url) {
+    return;
+  }
+
+  targets.push({
+    id: `post-${index + 1}`,
+    kind: 'post',
+    label: `Post ${index + 1}`,
+    url
+  });
+});
+
+process.stdout.write(`${JSON.stringify(targets)}\n`);
+NODE
+)"
+
   set +e
-  output="$("$NODE_BIN" "$NODE_CHECK_PROFILE_SCRIPT" --profile-url "$profile_url" 2>/dev/null)"
+  output="$("$NODE_BIN" "$NODE_CHECK_PROFILE_SCRIPT" --targets-json "$targets_json" 2>/dev/null)"
   exit_code=$?
   set -e
 
@@ -2898,17 +2970,7 @@ run_profile_status_check() {
     return "$exit_code"
   fi
 
-  output="${output//$'\r'/}"
-  status="$(printf '%s\n' "$output" | tail -n 1 | tr -d '\n' | tr -d '\r')"
-
-  case "${status,,}" in
-    banned)
-      printf 'Banned\n'
-      ;;
-    *)
-      printf 'Pending\n'
-      ;;
-  esac
+  printf '%s\n' "$output"
 }
 
 tui_refresh_report_statuses() {
@@ -2926,9 +2988,15 @@ tui_refresh_report_statuses() {
   local line=""
   local label=""
   local profile_url=""
+  local post_urls_json="[]"
+  local post_statuses_json="[]"
   local report_id=""
   local report_index=0
-  local status=""
+  local result_json=""
+  local status_line=""
+  local next_profile_status="Unreachable"
+  local next_status_checked_at=""
+  local next_post_statuses_json="[]"
   local -a refresh_lines=()
 
   if [[ ! -d "$ROOT_DIR/node_modules/playwright-core" ]]; then
@@ -2950,7 +3018,7 @@ tui_refresh_report_statuses() {
       tui_parse_report_line "${REPORT_LINES[$idx]}"
 
       if [[ "$REPORT_ID" == "$target_id" ]]; then
-        refresh_lines+=("${idx}|${target_id}|${target_label}|${target_url}")
+        refresh_lines+=("${idx}|${target_id}|${target_label}|${target_url}|${REPORT_POST_URLS_JSON:-[]}|${REPORT_POST_STATUSES_JSON:-[]}|${REPORT_STATUS_CHECKED_AT:-}")
         break
       fi
     done
@@ -2960,7 +3028,7 @@ tui_refresh_report_statuses() {
     for idx in "${!REPORT_LINES[@]}"; do
       line="${REPORT_LINES[$idx]}"
       tui_parse_report_line "$line"
-      refresh_lines+=("${idx}|${REPORT_ID}|${REPORT_TARGET}|${REPORT_PROFILE_URL}")
+      refresh_lines+=("${idx}|${REPORT_ID}|${REPORT_TARGET}|${REPORT_PROFILE_URL}|${REPORT_POST_URLS_JSON:-[]}|${REPORT_POST_STATUSES_JSON:-[]}|${REPORT_STATUS_CHECKED_AT:-}")
     done
   fi
 
@@ -2973,26 +3041,43 @@ tui_refresh_report_statuses() {
   tui_render_report_list_view "$selected_index" "$focus_mode" "$action_index" ""
 
   for idx in "${!refresh_lines[@]}"; do
-    IFS='|' read -r report_index report_id label profile_url <<<"${refresh_lines[$idx]}"
+    IFS='|' read -r report_index report_id label profile_url post_urls_json post_statuses_json status_checked_at <<<"${refresh_lines[$idx]}"
 
-    tui_set_report_line_status_local "$report_index" "Loading"
-    tui_render_report_card_region "$selected_index"
+    tui_set_report_check_results_local "$report_index" "Loading" "$status_checked_at" "[]"
+    tui_render_report_card_region "$selected_index" "$focus_mode"
     tui_render_report_action_region "$selected_index" "${#REPORT_LINES[@]}" "$focus_mode" "$action_index"
     tui_render_report_footer_region "$selected_index" "${#REPORT_LINES[@]}" "$focus_mode" ""
 
-    status="Pending"
-    if status="$(run_profile_status_check "$profile_url")"; then
-      :
-    else
-      status="Pending"
+    result_json=""
+    if ! result_json="$(run_report_status_check "$profile_url" "$post_urls_json")"; then
       failures=$((failures + 1))
+      next_profile_status="Unreachable"
+      next_status_checked_at="$status_checked_at"
+      next_post_statuses_json="$(build_unreachable_post_statuses_json "$post_urls_json" "$status_checked_at")"
+    else
+      status_line=""
+      if status_line="$(tui_update_report_check_results "$report_id" "$result_json")"; then
+        IFS='|' read -r next_profile_status next_status_checked_at next_post_statuses_json <<<"$status_line"
+      else
+        next_profile_status="Unreachable"
+        next_status_checked_at="$status_checked_at"
+        next_post_statuses_json="$(build_unreachable_post_statuses_json "$post_urls_json" "$status_checked_at")"
+        failures=$((failures + 1))
+      fi
     fi
 
-    tui_set_report_account_status "$report_id" "$status"
-    tui_set_report_line_status_local "$report_index" "$status"
+    if [[ -z "$next_profile_status" ]]; then
+      next_profile_status="Unreachable"
+    fi
+
+    if [[ -z "$next_post_statuses_json" ]]; then
+      next_post_statuses_json="$(build_unreachable_post_statuses_json "$post_urls_json" "$next_status_checked_at")"
+    fi
+
+    tui_set_report_check_results_local "$report_index" "$next_profile_status" "$next_status_checked_at" "$next_post_statuses_json"
 
     processed=$((processed + 1))
-    tui_render_report_card_region "$selected_index"
+    tui_render_report_card_region "$selected_index" "$focus_mode"
     tui_render_report_action_region "$selected_index" "${#REPORT_LINES[@]}" "$focus_mode" "$action_index"
     tui_render_report_footer_region "$selected_index" "${#REPORT_LINES[@]}" "$focus_mode" ""
   done
@@ -3083,11 +3168,20 @@ tui_render_report_card() {
     banned*)
       status_color="${RED}${BOLD}"
       ;;
+    active*)
+      status_color="${GREEN}${BOLD}"
+      ;;
     loading*)
+      status_color="${YELLOW}${BOLD}"
+      ;;
+    unreachable*)
       status_color="${YELLOW}${BOLD}"
       ;;
     pending*)
       status_color="$MUTED_FG"
+      ;;
+    inactive*)
+      status_color="${YELLOW}${BOLD}"
       ;;
     *)
       status_color="$color"
@@ -3534,8 +3628,17 @@ tui_render_report_list_card_at() {
     banned*)
       status_color="${RED}${BOLD}"
       ;;
+    active*)
+      status_color="${GREEN}${BOLD}"
+      ;;
+    unreachable*)
+      status_color="${YELLOW}${BOLD}"
+      ;;
     pending*)
       status_color="$MUTED_FG"
+      ;;
+    inactive*)
+      status_color="$YELLOW${BOLD}"
       ;;
     *)
       status_color="$text_color"
@@ -3546,6 +3649,46 @@ tui_render_report_list_card_at() {
   tui_render_box_centered_text_at "$((row + 1))" "$col" "$((width + 2))" "$target" "$text_color" "$border_color"
   tui_render_box_centered_text_at "$((row + 2))" "$col" "$((width + 2))" "$status" "$status_color" "$border_color"
   tui_render_box_centered_text_at "$((row + 3))" "$col" "$((width + 2))" "$created_at" "$text_color" "$border_color"
+}
+
+tui_render_report_detail_card_at() {
+  local row="$1"
+  local col="$2"
+  local selected="$3"
+  local target="$4"
+  local profile_status="$5"
+  local data_line="$6"
+  local post_urls_json="${7:-[]}"
+  local post_statuses_json="${8:-[]}"
+  local width=26
+  local border_color="$PRIMARY_FG"
+  local text_color="$PRIMARY_FG"
+  local detail_lines=()
+  local detail_line=""
+  local detail_height=0
+  local idx=0
+
+  if [[ "$selected" == "1" ]]; then
+    border_color="${SELECT_FG}${BOLD}"
+    text_color="${SELECT_FG}${BOLD}"
+  fi
+
+  while IFS= read -r detail_line; do
+    [[ -z "$detail_line" ]] && continue
+    detail_lines+=("$detail_line")
+  done < <(tui_build_report_status_detail_lines "$target" "$profile_status" "$data_line" "$post_urls_json" "$post_statuses_json")
+
+  detail_height=$(( ${#detail_lines[@]} + 2 ))
+  if (( detail_height < 7 )); then
+    detail_height=7
+  fi
+
+  tui_clear_block_at "$row" "$detail_height"
+  tui_draw_box_at "$row" "$col" "$((width + 2))" "$detail_height" "$border_color"
+
+  for idx in "${!detail_lines[@]}"; do
+    tui_render_box_centered_text_at "$((row + 1 + idx))" "$col" "$((width + 2))" "${detail_lines[$idx]}" "$text_color" "$border_color"
+  done
 }
 
 tui_configuration_action_row() {
@@ -3722,8 +3865,24 @@ tui_report_action_row() {
   printf '%s' "$row"
 }
 
+tui_build_report_status_detail_lines() {
+  local target="$1"
+  local profile_status="$2"
+  local data_line="$3"
+  local post_urls_json="${4:-[]}"
+  local post_statuses_json="${5:-[]}"
+
+  "$NODE_BIN" "$NODE_REPORT_STATUS_LINES_SCRIPT" \
+    --target "$target" \
+    --profile-status "$profile_status" \
+    --data-line "$data_line" \
+    --post-urls-json "$post_urls_json" \
+    --post-statuses-json "$post_statuses_json"
+}
+
 tui_render_report_card_region() {
   local selected_index="$1"
+  local focus_mode="${2:-cards}"
   local card_row=0
   local header_top=0
   local total_reports="${#REPORT_LINES[@]}"
@@ -3745,13 +3904,16 @@ tui_render_report_card_region() {
   local col=1
   local row=0
   local clear_bottom=0
+  local card_step=6
 
   grid_cols="$(tui_report_grid_columns)"
   page_size="$(tui_report_page_size)"
   page_start="$(tui_report_page_start "$selected_index" "$total_reports")"
   visible_count="$(tui_report_visible_count "$selected_index" "$total_reports")"
   rows_used="$(tui_report_rows_used "$selected_index" "$total_reports")"
-  content_height=$((rows_used * 6 - 1))
+  card_step=8
+
+  content_height=$((rows_used * card_step - 1))
   action_row="$(tui_report_action_row "$selected_index" "$total_reports")"
   card_row="$(tui_centered_region_top_row "$content_height" "$((action_row - 2))")"
   header_top=$((card_row - 4))
@@ -3782,9 +3944,9 @@ tui_render_report_card_region() {
     row_offset=$((slot / grid_cols))
     col_offset=$((slot % grid_cols))
     col=$((start_col + (col_offset * card_total_width)))
-    row=$((card_row + (row_offset * 6)))
+    row=$((card_row + (row_offset * card_step)))
     tui_parse_report_line "${REPORT_LINES[$card_index]}"
-    tui_render_report_list_card_at "$row" "$col" "$([[ "$card_index" == "$selected_index" ]] && printf 1 || printf 0)" "$REPORT_TARGET" "$REPORT_STATUS" "$REPORT_CREATED_AT"
+    tui_render_report_detail_card_at "$row" "$col" "$([[ "$card_index" == "$selected_index" ]] && printf 1 || printf 0)" "$REPORT_TARGET" "$REPORT_STATUS" "${REPORT_STATUS_CHECKED_AT:-$REPORT_CREATED_AT}" "${REPORT_POST_URLS_JSON:-[]}" "${REPORT_POST_STATUSES_JSON:-[]}"
   done
 }
 
@@ -3795,6 +3957,11 @@ tui_render_report_action_region() {
   local action_index="$4"
   local action_row
   action_row="$(tui_report_action_row "$selected_index" "$total_reports")"
+
+  if (( ${#REPORT_LINES[@]} == 0 )); then
+    tui_clear_block_at "$action_row" 7
+    return
+  fi
 
   if [[ "$focus_mode" != "actions" ]]; then
     tui_clear_block_at "$action_row" 7
@@ -4068,7 +4235,7 @@ tui_render_report_list_dynamic() {
   local notice="${4-}"
   local total_reports="${#REPORT_LINES[@]}"
 
-  tui_render_report_card_region "$selected_index"
+  tui_render_report_card_region "$selected_index" "$focus_mode"
   tui_render_report_action_region "$selected_index" "$total_reports" "$focus_mode" "$action_index"
   tui_render_report_footer_region "$selected_index" "$total_reports" "$focus_mode" "$notice"
 }
@@ -4519,7 +4686,7 @@ tui_report_list_menu() {
     if (( result == 0 )); then
       notice="Stati account aggiornati."
     else
-      notice="Verifica parziale: alcuni account sono rimasti Pending."
+      notice="Verifica incompleta: alcuni link risultano unreachable."
     fi
   fi
 
@@ -4539,7 +4706,7 @@ tui_report_list_menu() {
       tui_render_report_list_view "$selected_index" "$focus_mode" "$action_index" "$notice"
       redraw_mode=""
     elif [[ "$redraw_mode" == "card" ]]; then
-      tui_render_report_card_region "$selected_index"
+      tui_render_report_card_region "$selected_index" "$focus_mode"
       tui_render_report_footer_region "$selected_index" "$total_reports" "$focus_mode" "$notice"
       redraw_mode=""
     elif [[ "$redraw_mode" == "actions" ]]; then
@@ -4639,11 +4806,11 @@ tui_report_list_menu() {
               action_index=0
               tui_capture_status tui_refresh_report_statuses single "$REPORT_ID" "$REPORT_TARGET" "$REPORT_PROFILE_URL" "$selected_index" "$focus_mode" "$action_index"
               result=$CAPTURED_STATUS
-              if (( result == 0 )); then
-                notice="Controllo aggiornato."
-              else
-                notice="Controllo incompleto: stato lasciato su Pending."
-              fi
+    if (( result == 0 )); then
+      notice="Controllo aggiornato."
+    else
+      notice="Controllo incompleto: stato lasciato su Unreachable."
+    fi
               redraw_mode="full"
               ;;
           esac

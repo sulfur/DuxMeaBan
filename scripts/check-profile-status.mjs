@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { chromium } from 'playwright-core';
 
@@ -54,6 +55,10 @@ function assertString(value, name) {
   }
 
   return value.trim();
+}
+
+function normalizeOptionalString(value) {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
 function resolveCommandPath(command) {
@@ -124,11 +129,36 @@ function detectBrowserPath() {
     }
   }
 
-  throw new Error(
-    process.platform === 'win32'
-      ? 'No supported browser executable found for Playwright status checks. Set PLAYWRIGHT_BROWSER_PATH or install Chrome or Edge for Windows.'
-      : 'No supported browser executable found for Playwright status checks. Set PLAYWRIGHT_BROWSER_PATH or install Chromium, Chrome, or Edge for Linux.'
-  );
+  return '';
+}
+
+function parseTargetsJson(rawValue) {
+  const raw = normalizeOptionalString(rawValue);
+
+  if (!raw) {
+    return [];
+  }
+
+  let parsed = [];
+
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+
+  if (!Array.isArray(parsed)) {
+    return [];
+  }
+
+  return parsed
+    .map((target) => ({
+      id: normalizeOptionalString(target?.id),
+      kind: normalizeOptionalString(target?.kind) || 'profile',
+      label: normalizeOptionalString(target?.label),
+      url: normalizeOptionalString(target?.url)
+    }))
+    .filter((target) => target.url.length > 0);
 }
 
 function normalizeText(value) {
@@ -157,23 +187,18 @@ function isBannedState({ statusCode, title, bodyText, finalUrl }) {
   });
 }
 
-async function main() {
-  const args = parseArgs(process.argv);
-  const profileUrl = assertString(args['profile-url'], 'profile-url');
-  const browserPath = detectBrowserPath();
+function nowLocalTimestamp() {
+  const pad = (value) => String(value).padStart(2, '0');
+  const now = new Date();
 
-  const browser = await chromium.launch({
-    headless: true,
-    executablePath: browserPath
-  });
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+}
+
+async function checkTargetStatusWithBrowser(context, target) {
+  const page = await context.newPage();
 
   try {
-    const context = await browser.newContext({
-      viewport: { width: 1280, height: 1600 }
-    });
-    const page = await context.newPage();
-
-    const response = await page.goto(profileUrl, {
+    const response = await page.goto(target.url, {
       waitUntil: 'domcontentloaded',
       timeout: NAVIGATION_TIMEOUT_MS
     });
@@ -184,15 +209,136 @@ async function main() {
     const bodyText = await page.locator('body').innerText().catch(() => '');
     const finalUrl = page.url();
     const statusCode = response?.status?.() ?? 0;
-    const accountStatus = isBannedState({ statusCode, title, bodyText, finalUrl }) ? 'Banned' : 'Pending';
+    const accountStatus = isBannedState({ statusCode, title, bodyText, finalUrl }) ? 'Banned' : 'Active';
 
-    process.stdout.write(`${accountStatus}\n`);
+    return {
+      id: target.id,
+      kind: target.kind,
+      label: target.label,
+      url: target.url,
+      status: accountStatus,
+      checkedAtLocal: nowLocalTimestamp()
+    };
+  } catch (error) {
+    return {
+      id: target.id,
+      kind: target.kind,
+      label: target.label,
+      url: target.url,
+      status: 'Unreachable',
+      checkedAtLocal: nowLocalTimestamp(),
+      error: error instanceof Error ? error.message : String(error)
+    };
   } finally {
-    await browser.close();
+    await page.close().catch(() => {});
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exit(1);
-});
+function extractHtmlTitle(html) {
+  const match = String(html || '').match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+
+  if (!match) {
+    return '';
+  }
+
+  return String(match[1] || '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function checkTargetStatusWithFetch(target) {
+  try {
+    const response = await fetch(target.url, {
+      method: 'GET',
+      redirect: 'follow',
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
+    });
+    const bodyText = await response.text().catch(() => '');
+    const title = extractHtmlTitle(bodyText);
+    const finalUrl = response.url || target.url;
+    const statusCode = response.status || 0;
+    const accountStatus = isBannedState({ statusCode, title, bodyText, finalUrl }) ? 'Banned' : 'Active';
+
+    return {
+      id: target.id,
+      kind: target.kind,
+      label: target.label,
+      url: target.url,
+      status: accountStatus,
+      checkedAtLocal: nowLocalTimestamp()
+    };
+  } catch (error) {
+    return {
+      id: target.id,
+      kind: target.kind,
+      label: target.label,
+      url: target.url,
+      status: 'Unreachable',
+      checkedAtLocal: nowLocalTimestamp(),
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+export async function checkTargets(targets) {
+  const browserPath = detectBrowserPath();
+
+  if (!browserPath) {
+    return Promise.all(targets.map((target) => checkTargetStatusWithFetch(target)));
+  }
+
+  let browser = null;
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      executablePath: browserPath
+    });
+  } catch {
+    return Promise.all(targets.map((target) => checkTargetStatusWithFetch(target)));
+  }
+
+  try {
+    const context = await browser.newContext({
+      viewport: { width: 1280, height: 1600 }
+    });
+
+    return Promise.all(targets.map((target) => checkTargetStatusWithBrowser(context, target)));
+  } finally {
+    await browser?.close();
+  }
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+  const targets = parseTargetsJson(args['targets-json']);
+
+  if (targets.length > 0) {
+    const results = await checkTargets(targets);
+    process.stdout.write(`${JSON.stringify({ results })}\n`);
+    return;
+  }
+
+  const profileUrl = assertString(args['profile-url'], 'profile-url');
+  const [profileResult] = await checkTargets([
+    {
+      id: 'profile',
+      kind: 'profile',
+      label: 'Profile',
+      url: profileUrl
+    }
+  ]);
+
+  process.stdout.write(`${profileResult.status}\n`);
+}
+
+if (fileURLToPath(import.meta.url) === process.argv[1]) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}

@@ -7,7 +7,8 @@
   "scripts": {
     "start": "bash ./report.sh",
     "assist": "node ./scripts/assist.mjs",
-    "check-status": "node ./scripts/check-profile-status.mjs"
+    "check-status": "node ./scripts/check-profile-status.mjs",
+    "test:report-status": "node ./scripts/test-report-status-lines.mjs && node ./scripts/test-report-status-results.mjs && node ./scripts/test-check-profile-status.mjs"
   },
   "dependencies": {
     "playwright-core": "^1.54.2"
